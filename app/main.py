@@ -1,0 +1,393 @@
+from pathlib import Path
+from fastapi import FastAPI, UploadFile, File, HTTPException, APIRouter, Depends
+from fastapi.staticfiles import StaticFiles
+from starlette.responses import FileResponse
+from io import StringIO
+import pandas as pd
+import os
+import json
+from datetime import date, timedelta
+
+# ---------- SQLAlchemy (async) ----------
+from sqlalchemy import (
+    select, update, insert, delete, String, Boolean, Text, Date, func, JSON
+)
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.ext.asyncio import (
+    AsyncSession, create_async_engine, async_sessionmaker
+)
+
+# =========================
+# Config DB
+# =========================
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql+asyncpg://postgres:c4rec4@147.182.190.223:5432/gtim_services"
+)
+
+engine = create_async_engine(DATABASE_URL, echo=False, pool_pre_ping=True)
+SessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+
+async def get_session():
+    async with SessionLocal() as session:
+        yield session
+
+# =========================
+# ORM exacto a tus tablas
+# =========================
+class Base(DeclarativeBase):
+    pass
+
+class WhrEnduser(Base):
+    __tablename__ = "whr_enduser"
+    __table_args__ = {"schema": "public"}   # <= usa 'compat' si ahí está user_tags
+
+    user_id: Mapped[str] = mapped_column(String(20), primary_key=True)
+
+    # NOMBRES NUEVOS EN BD
+    user_email: Mapped[str] = mapped_column(String(255))
+    user_location: Mapped[str] = mapped_column(String(100), default="")
+    user_country: Mapped[str] = mapped_column(String(100), default="")
+    user_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    user_wp_display_name: Mapped[str] = mapped_column(String(150), default="")
+
+    supervisor_user_id: Mapped[str] = mapped_column(String(20), default="")
+    supervisor_wp_display_name: Mapped[str] = mapped_column(String(150), default="")
+    supervisor_email: Mapped[str] = mapped_column(String(255), default="")
+
+    # NUEVO CAMPO (ya existe en tu tabla)
+    user_tags: Mapped[str] = mapped_column(String(255), default="")
+
+
+class WhrDevice(Base):
+    __tablename__ = "whr_device"
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+
+    contract_id:             Mapped[str]         = mapped_column(String(255), default="")
+    contract_start_date:     Mapped[date | None] = mapped_column(Date, nullable=True)
+    contract_maturity_date:  Mapped[date | None] = mapped_column(Date, nullable=True)
+    asset_serial_number:     Mapped[str]         = mapped_column(String(255), default="")
+    asset_tag:               Mapped[str]         = mapped_column(String(255), default="")
+    asset_description:       Mapped[str]         = mapped_column(String(500), default="")
+    device_type:             Mapped[str]         = mapped_column(String(100), default="")
+    device_status:           Mapped[str]         = mapped_column(String(100), default="")
+    device_other_info:       Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+# =========================
+# FastAPI
+# =========================
+app = FastAPI(
+    title="Svelte SPA + API CSV (PostgreSQL)",
+    version="1.4.0",
+    description="Sube CSVs (usuarios/dispositivos) y guarda/consulta en PostgreSQL.",
+)
+
+# ---------- Helpers ----------
+def _to_bool(x) -> bool:
+    return str(x).strip().lower() in {"true", "1", "si", "sí", "yes", "y"}
+
+def _norm_cols(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
+    return df
+
+def _parse_date_any(x):
+    """Devuelve datetime.date o None. Acepta varios formatos y serial de Excel."""
+    if x is None:
+        return None
+    s = str(x).strip()
+    if not s or s.lower() in {"nan", "nat", "none", "null"}:
+        return None
+
+    # ¿serial Excel? (días desde 1899-12-30)
+    if s.isdigit() and len(s) <= 7:
+        try:
+            return date(1899, 12, 30) + timedelta(days=int(s))
+        except Exception:
+            pass
+
+    ts = pd.to_datetime(s, errors="coerce", dayfirst=True)
+    if pd.isna(ts):
+        return None
+    return ts.date()
+
+api = APIRouter()
+
+# =======================
+# Upload CSV
+# =======================
+@api.post("/upload-csv")
+@api.post("/upload-csv/")
+async def upload_csv(
+    file: UploadFile = File(...),
+    session: AsyncSession = Depends(get_session)
+):
+    if not file.filename.lower().endswith(".csv"):
+        raise HTTPException(400, "El archivo debe ser CSV (.csv)")
+
+    raw = await file.read()
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        text = raw.decode("latin-1")
+
+    # Leemos todo como texto
+    try:
+        df = pd.read_csv(StringIO(text), dtype=str)
+    except Exception as e:
+        raise HTTPException(400, f"No se pudo leer el CSV: {e}")
+
+    df = _norm_cols(df)
+    cols = set(df.columns)
+    n = len(df)
+
+    # =======================
+    # DISPOSITIVOS  (acepta viejo y nuevo)
+    # =======================
+    if (
+        {"contract_id", "asset_serial_number", "asset_tag", "asset_description"}.issubset(cols)
+        or {"contract_id", "contract_maturity_date", "asset_serial_number", "asset_tag", "asset_description"}.issubset(cols)
+        or {"contract_id", "maturity_date", "asset_serial_number", "asset_tag", "asset_description"}.issubset(cols)
+    ):
+        def s(name: str, limit: int | None = None):
+            series = df[name].astype(str).fillna("").str.strip() if name in df else pd.Series([""] * n)
+            return series.str.slice(0, limit) if limit else series
+
+        # fechas: soporta nombres nuevos y viejos
+        csd = df["contract_start_date"].apply(_parse_date_any) if "contract_start_date" in df else [None] * n
+        cmd = (
+            df["contract_maturity_date"].apply(_parse_date_any)
+            if "contract_maturity_date" in df
+            else (df["maturity_date"].apply(_parse_date_any) if "maturity_date" in df else [None] * n)
+        )
+
+        # también aceptamos otros aliases
+        other_info = None
+        if "device_other_info" in df:
+            def _parse_other(x):
+                s = str(x).strip()
+                if not s:
+                    return {}
+                try:
+                    return json.loads(s)
+                except Exception:
+                    return {}
+            try:
+                other_info = df["device_other_info"].apply(_parse_other)
+            except Exception:
+                other_info = None
+
+        registros = pd.DataFrame({
+            "contract_id":            s("contract_id", 255),
+            "contract_start_date":    csd,
+            "contract_maturity_date": cmd,
+            "asset_serial_number":    s("asset_serial_number", 255),
+            "asset_tag":              s("asset_tag", 255),
+            "asset_description":      s("asset_description", 500),
+            "device_type":            s("device_type", 100) if "device_type" in df else pd.Series([""] * n),
+            "device_status":          s("device_status", 100) if "device_status" in df else pd.Series([""] * n),
+        })
+
+        # normalizamos y evitamos duplicados en el archivo
+        registros["asset_tag"] = registros["asset_tag"].astype(str).str.strip()
+        registros = registros[registros["asset_tag"] != ""]
+        registros = registros.drop_duplicates(subset=["asset_tag"], keep="last")
+
+        # upsert por asset_tag
+        for row in registros.to_dict(orient="records"):
+            tag = row["asset_tag"]
+            res = await session.execute(select(WhrDevice).where(WhrDevice.asset_tag == tag))
+            existing = res.scalars().first()
+
+            if existing:
+                await session.execute(
+                    update(WhrDevice)
+                    .where(WhrDevice.asset_tag == tag)
+                    .values(
+                        contract_id=row["contract_id"],
+                        contract_start_date=row["contract_start_date"],
+                        contract_maturity_date=row["contract_maturity_date"],
+                        asset_serial_number=row["asset_serial_number"],
+                        asset_description=row["asset_description"],
+                        device_type=row["device_type"],
+                        device_status=row["device_status"],
+                    )
+                )
+            else:
+                await session.execute(insert(WhrDevice).values(row))
+
+        await session.commit()
+        res_total = await session.execute(select(func.count()).select_from(WhrDevice))
+        total = res_total.scalar_one()
+        return {"mensaje": "CSV de dispositivos cargado", "dataset": "dispositivos", "total": total}
+    # USUARIOS
+    elif {"user_id","email","location","country","active","wp_display_name"}.issubset(cols) or \
+         {"user_id","user_email","user_location","user_country","user_active","user_wp_display_name"}.issubset(cols):
+
+        registros = pd.DataFrame({
+            "user_id": df.get("user_id", ""),
+            "user_email": df.get("user_email", df.get("email", "")),
+            "user_location": df.get("user_location", df.get("location", "")),
+            "user_country": df.get("user_country", df.get("country", "")),
+            "user_active": df.get("user_active", df.get("active", "")).map(_to_bool),
+            "user_wp_display_name": df.get("user_wp_display_name", df.get("wp_display_name", "")),
+            "supervisor_user_id": df.get("supervisor_user_id", ""),
+            "supervisor_wp_display_name": df.get("supervisor_wp_display_name", ""),
+            "supervisor_email": df.get("supervisor_email", ""),
+            "user_tags": df.get("user_tags", df.get("tags", "")),
+        }).fillna("")
+
+        for row in registros.to_dict(orient="records"):
+            uid = str(row["user_id"]).strip()
+            email = str(row["user_email"]).strip()
+            if not uid and not email:
+                continue
+
+            existing = None
+            if uid:
+                res = await session.execute(select(WhrEnduser).where(WhrEnduser.user_id == uid))
+                existing = res.scalars().first()
+
+            if not existing and email:
+                res = await session.execute(select(WhrEnduser).where(WhrEnduser.user_email == email))
+                existing = res.scalars().first()
+
+            if existing:
+                filt = (WhrEnduser.user_id == uid) if uid else (WhrEnduser.user_email == email)
+                await session.execute(
+                    update(WhrEnduser)
+                    .where(filt)
+                    .values(
+                        user_email=row["user_email"],
+                        user_location=row["user_location"],
+                        user_country=row["user_country"],
+                        user_active=row["user_active"],
+                        user_wp_display_name=row["user_wp_display_name"],
+                        supervisor_user_id=row["supervisor_user_id"],
+                        supervisor_wp_display_name=row["supervisor_wp_display_name"],
+                        supervisor_email=row["supervisor_email"],
+                        user_tags=row["user_tags"],
+                    )
+                )
+            else:
+                if not uid:
+                    continue
+                await session.execute(insert(WhrEnduser).values(row))
+
+        await session.commit()
+        res_total = await session.execute(select(func.count()).select_from(WhrEnduser))
+        total = res_total.scalar_one()
+        return {"mensaje": "CSV de usuarios cargado", "dataset": "usuarios", "total": total}
+
+    else:
+        raise HTTPException(
+            400,
+            (
+                "No se reconoció el tipo de CSV.\n"
+                "- Dispositivos (nuevo/legacy): contract_id, contract_start_date/contract_maturity_date|maturity_date, "
+                "asset_serial_number, asset_tag, asset_description, [device_type], [device_status]\n"
+                "- Usuarios (nuevo): user_id, user_email, user_location, user_country, user_active, user_wp_display_name, "
+                "[supervisor_*], [user_tags]\n"
+                "- Usuarios (viejo): user_id, email, location, country, active, wp_display_name, [supervisor_*], [tags]\n"
+            ),
+        )
+
+
+# =======================
+# Endpoints de consulta
+# =======================
+@api.get("/usuarios")
+async def get_usuarios(session: AsyncSession = Depends(get_session)):
+    res = await session.execute(select(WhrEnduser))
+    users = res.scalars().all()
+
+    items = []
+    for u in users:
+        nombre = (u.user_wp_display_name or "").strip()
+        email = (u.user_email or "").strip()
+        departamento = (u.user_location or "").strip()
+        activo = bool(u.user_active)
+
+        if not nombre and "@" in email:
+            nombre = email.split("@")[0].replace(".", " ").replace("_", " ").strip()
+
+        items.append({
+            "nombre": nombre,
+            "email": email,
+            "departamento": departamento,
+            "activo": activo,
+            "user_id": u.user_id,
+            "country": u.user_country or "",
+            "supervisor_user_id": u.supervisor_user_id or "",
+            "supervisor_wp_display_name": u.supervisor_wp_display_name or "",
+            "supervisor_email": u.supervisor_email or "",
+            "tags": u.user_tags or "",        # <— NUEVO
+        })
+
+    return {"total": len(items), "items": items}
+
+@api.delete("/usuarios/{user_id}")
+async def delete_usuario(user_id: str, session: AsyncSession = Depends(get_session)):
+    res = await session.execute(select(WhrEnduser).where(WhrEnduser.user_id == user_id))
+    obj = res.scalars().first()
+    if not obj:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+
+    await session.execute(delete(WhrEnduser).where(WhrEnduser.user_id == user_id))
+    await session.commit()
+    return {"ok": True, "user_id": user_id}
+
+@api.get("/dispositivos")
+async def get_dispositivos(session: AsyncSession = Depends(get_session)):
+    res = await session.execute(select(WhrDevice))
+    devs = res.scalars().all()
+    items = [
+        {
+            "nombre": d.asset_description or "",
+            "serie": d.asset_serial_number or "",
+            "tipo": d.device_type or "",
+            "activo": True,
+            "id": d.id,
+            "asset_tag": d.asset_tag or "",
+            "contract_id": d.contract_id or "",
+            "contract_start_date": d.contract_start_date.isoformat() if d.contract_start_date else None,
+            "contract_maturity_date": d.contract_maturity_date.isoformat() if d.contract_maturity_date else None,
+            "device_status": d.device_status or "",
+        }
+        for d in devs
+    ]
+    return {"total": len(items), "items": items}
+
+@api.delete("/dispositivos/{device_id}")
+async def delete_dispositivo_by_id(device_id: int, session: AsyncSession = Depends(get_session)):
+    res = await session.execute(select(WhrDevice).where(WhrDevice.id == device_id))
+    obj = res.scalars().first()
+    if not obj:
+        raise HTTPException(status_code=404, detail="Dispositivo no encontrado")
+    await session.execute(delete(WhrDevice).where(WhrDevice.id == device_id))
+    await session.commit()
+    return {"ok": True, "id": device_id}
+
+@api.post("/reset")
+async def reset_dummy():
+    return {"ok": True, "nota": "Los datos viven en PostgreSQL."}
+
+app.include_router(api, prefix="/api")
+
+# =======================
+# Servir frontend /dist
+# =======================
+ROOT = Path(__file__).resolve().parents[2]
+DIST_DIR = ROOT / "dist"
+
+if not DIST_DIR.exists():
+    print("⚠️  No existe dist/. Ejecuta `npm run build` en la raíz.")
+
+app.mount("/", StaticFiles(directory=str(DIST_DIR), html=True), name="static")
+
+@app.get("/{full_path:path}")
+def spa_fallback(full_path: str):
+    index_file = DIST_DIR / "index.html"
+    if index_file.exists():
+        return FileResponse(index_file)
+    return {"message": "Build no encontrado. Ejecuta `npm run build`."}
